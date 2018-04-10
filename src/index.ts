@@ -1,17 +1,55 @@
 import { Server } from 'http'
 import * as pino from 'pino'
 import { createContainer } from './container'
+import { AppError } from './errors'
 import { MySql } from './lib/database'
 import * as server from './server'
 
-export async function init() {
+export interface Application {
+  logger: pino.Logger
+  database: MySql
+  server: Server
+}
+
+function registerProcessEvents(app: Application) {
+  process.on('uncaughtException', (error: Error) => {
+    app.logger.error('UncaughtException', error)
+  })
+
+  process.on('unhandledRejection', (reason: any, promise: any) => {
+    app.logger.info(reason, promise)
+  })
+
+  process.on('SIGTERM', async () => {
+    app.logger.info('Starting graceful shutdown')
+
+    let exitCode = 0
+    const shutdown = [
+      server.closeServer(app.server),
+      app.database.closeDatabase()
+    ]
+
+    for (const s of shutdown) {
+      try {
+        await s
+      } catch (e) {
+        app.logger.error('Error in graceful shutdown ', e)
+        exitCode = 1
+      }
+    }
+
+    process.exit(exitCode)
+  })
+}
+
+export async function initialize(): Promise<Application> {
   const logger = pino()
 
   try {
     // Starting the HTTP server
     logger.info('Starting HTTP server')
 
-    const db = new MySql({
+    const database = new MySql({
       database: 'task_manager',
       host: process.env.DB_HOST,
       port: Number(process.env.DB_PORT) || 3306,
@@ -21,47 +59,28 @@ export async function init() {
     })
 
     logger.info('Apply database migration')
-    await db.schemaMigration()
+    await database.schemaMigration()
 
     const port = process.env.PORT || 8080
-    const container = createContainer(db, logger)
-    const app = server.createServer(container).listen(port)
-
-    // Register global process events and graceful shutdown
-    registerProcessEvents(logger, app, db)
+    const container = createContainer(database, logger)
+    const appServer = server.createServer(container).listen(port)
 
     logger.info(`Application running on port: ${port}`)
-  } catch (e) {
-    logger.error(e, 'An error occurred while initializing application.')
+
+    return { logger, database, server: appServer }
+  } catch (ex) {
+    throw new AppError(
+      10000,
+      'An error occurred while initializing application.',
+      ex
+    )
   }
 }
 
-function registerProcessEvents(logger: pino.Logger, app: Server, db: MySql) {
-  process.on('uncaughtException', (error: Error) => {
-    logger.error('UncaughtException', error)
-  })
+// tslint:disable-next-line:prettier
+(async () => {
+  const app = await initialize()
 
-  process.on('unhandledRejection', (reason: any, promise: any) => {
-    logger.info(reason, promise)
-  })
-
-  process.on('SIGTERM', async () => {
-    logger.info('Starting graceful shutdown')
-
-    let exitCode = 0
-    const shutdown = [server.closeServer(app), db.closeDatabase()]
-
-    for (const s of shutdown) {
-      try {
-        await s
-      } catch (e) {
-        logger.error('Error in graceful shutdown ', e)
-        exitCode = 1
-      }
-    }
-
-    process.exit(exitCode)
-  })
-}
-
-init()
+  // Register global process events and graceful shutdown
+  registerProcessEvents(app)
+})()
